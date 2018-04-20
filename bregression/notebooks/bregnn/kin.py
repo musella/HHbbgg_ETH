@@ -1,7 +1,7 @@
 import numpy as np
 
 from keras.layers import Input, Dense, Add, Multiply
-from keras.layers import Reshape, UpSampling1D, Flatten, concatenate, Cropping1D
+from keras.layers import Reshape, UpSampling1D, Flatten, Concatenate, Cropping1D, Convolution1D, RepeatVector
 from keras.layers import Activation, LeakyReLU, PReLU, Lambda
 from keras.layers import BatchNormalization, Dropout, GaussianNoise
 from keras.models import Model, Sequential
@@ -19,56 +19,40 @@ from keras.callbacks import TensorBoard, CSVLogger, ModelCheckpoint
 from sklearn.base import BaseEstimator
 
 from . import losses 
+from .ffwd import get_block
 
 # --------------------------------------------------------------------------------------------------
-class ConstOffsetLayer(Layer):
+def get_activations(activations,layers):
+    if type(activations) == str:
+        ret = [activations]*len(layers)
+    elif len(activations) < len(layers):
+        rat = len(layers) // len(activations)
+        remind = len(layers) % len(activations)
+        ret  = activations*rat
+        if remind > 0:
+            ret += activations[:remind]
+    else:
+        ret = activations
+    return ret
 
-    def __init__(self, values, **kwargs):
-        self.values = values
-        super(ConstOffsetLayer, self).__init__(**kwargs)
-
-    def get_config(self):
-        return { 'values' : self.values }
-        
-    def call(self, x):
-        return x+K.constant(self.values)
 
 # --------------------------------------------------------------------------------------------------
-def get_block(L,name,do_bn0,batch_norm,noise,use_bias,dropout,layers,activations,core=Dense):
-    if do_bn0:
-        L = BatchNormalization(name="%s_bn0" % name)(L)
+class KinRegression(BaseEstimator):
 
-    for ilayer,(isize,iact) in enumerate(zip(layers,activations)):
-        il = ilayer + 1
-        L = core(isize,use_bias=use_bias,name="%s_dense%d" % (name,il))(L)
-        ## L = Dense(isize,use_bias=use_bias,name="%s_dense%d" % (name,il))(L)
-        if batch_norm:
-            L = BatchNormalization(name="%s_bn%d" % (name,il))(L)
-        if noise is not None:
-            L = GaussianNoise(noise,name="%s_noi%d" % (name,il))(L)
-        if dropout is not None:
-            L = Dropout(dropout, name="%s_do%d" % (name,il))(L)
-        if iact is None:
-            pass
-        elif iact == "lrelu" or "lrelu_" in iact:
-            nslope = 0.2
-            if "_" in iact:
-                nslope = float(iact.rsplit("_",1))
-            L = LeakyReLU(nslope,name="%s_act%d_%s" % (name,il,iact))(L)
-        elif iact == "prelu":
-            L = PReLU(name="%s_act%d_%s" % (name,il,iact))(L)
-        else:
-            L = Activation(iact,name="%s_act%d_%s" % (name,il,iact))(L)
-    return L
-    
-# --------------------------------------------------------------------------------------------------
-class FFWDRegression(BaseEstimator):
-
-    def __init__(self,name,input_shape,output_shape=None,
+    def __init__(self,name,jets_shape,ev_shape,
+                 linv_shape,
+                 output_shape=None,
                  non_neg=False,
+                 jets_layers=[32]*4,
+                 jets_activations="lrelu",
+                 ev_layers=[16]*4,
+                 ev_activations="lrelu",
+                 fc1_layers=[512,256,128],
+                 fc1_activations="lrelu",
+                 fc2_layers=[128,64,32],
+                 fc2_activations="lrelu",
                  dropout=0.2, # 0.5 0.2
-                 batch_norm=True,activations="lrelu",
-                 layers=[1024]*5+[512,256,128], # 1024 / 2048
+                 batch_norm=True,
                  do_bn0=True,
                  const_output_biases=None, 
                  noise=None,
@@ -80,7 +64,10 @@ class FFWDRegression(BaseEstimator):
                  valid_frac=None,
     ):
         self.name = name
-        self.input_shape = input_shape
+        self.jets_shape = jets_shape
+        self.ev_shape = ev_shape
+        self.linv_shape = linv_shape
+        
         self.output_shape = output_shape
         self.const_output_biases = const_output_biases
 
@@ -88,17 +75,19 @@ class FFWDRegression(BaseEstimator):
         self.dropout = dropout
         self.batch_norm = batch_norm
         self.use_bias = not batch_norm
-        self.layers = layers
-        if type(activations) == str:
-            self.activations = [activations]*len(layers)
-        elif len(activations) < len(layers):
-            rat = len(layers) // len(activations)
-            remind = len(layers) % len(activations)
-            self.activations = activations*rat
-            if remind > 0:
-                self.activations += activations[:remind]
-        else:
-            self.activations = activations
+        
+        self.jets_layers = jets_layers
+        self.jets_activations = get_activations(jets_activations,self.jets_layers)
+        self.ev_layers = ev_layers
+        self.ev_activations = get_activations(ev_activations,self.ev_layers)
+        self.fc1_layers = fc1_layers
+        self.fc1_activations = get_activations(fc1_activations,self.fc1_layers)
+        if len(self.fc1_layers) > 0:
+            self.fc1_layers.append( self.linv_shape[-1] )
+            self.fc1_activations.append( None )
+        self.fc2_layers = fc2_layers
+        self.fc2_activations = get_activations(fc2_activations,self.fc2_layers)
+
         self.do_bn0 = do_bn0
         self.noise = noise
         
@@ -113,7 +102,7 @@ class FFWDRegression(BaseEstimator):
         
         self.model = None
 
-        super(FFWDRegression,self).__init__()
+        super(KinRegression,self).__init__()
         
     # ----------------------------------------------------------------------------------------------
     def __call__(self,docompile=False):
@@ -132,16 +121,56 @@ class FFWDRegression(BaseEstimator):
             output_shape = (getattr(loss,"n_params",1),)
             
         if self.model is None:
-            inputs = Input(shape=self.input_shape,name="%s_inp" % self.name)
+            jets_inputs = Input(shape=self.jets_shape,name="%s_jets_inp" % self.name)
+            ev_inputs = Input(shape=self.ev_shape,name="%s_ev_inp" % self.name)
+            linv_inputs = Input(shape=self.linv_shape,name="%s_linv_inp" % self.name)
+
+            inputs = [jets_inputs,ev_inputs,linv_inputs]
             
-            if len(self.input_shape)>1:
-                L = Flatten(name="%s_flt" % self.name)(inputs)
-            else:
-                L = inputs
+            Ljets = jets_inputs
+            Lev = ev_inputs
+            Llinv = linv_inputs
+
+            if self.do_bn0:
+                Ljets = BatchNormalization(name="%s_jets_nb0" % self.name)(Ljets)
+                Lev = BatchNormalization(name="%s_ev_nb0" % self.name)(Lev)
+                Llinv = BatchNormalization(name="%s_linb_nb0" % self.name)(Llinv)
+            Ljets0 = Ljets
+
+
+            if len(self.ev_layers) > 0:
+                Lev = get_block(Lev,self.name+"_ev",False,
+                                self.batch_norm,self.noise,self.use_bias,self.dropout,
+                                self.ev_layers,self.ev_activations)            
                 
-            L = get_block(L,self.name,self.do_bn0,
+            def get1x1(*args,**kwargs):
+                kwargs['kernel_size'] = 1
+                return Convolution1D(*args,**kwargs)
+
+            Levjets = RepeatVector(self.jets_shape[0],name="%s_ev_jets_rpt" % self.name)(Lev)
+            Ljets = Concatenate(name="%s_jets_concat" % self.name)([Ljets,Levjets])
+            Ljets = get_block(Ljets,self.name+"_jets",False,
+                              self.batch_norm,self.noise,self.use_bias,self.dropout,
+                              self.jets_layers,self.jets_activations,
+                              core = get1x1 )
+            Ljets = Flatten(name="%s_jets_flt" % self.name)(Ljets)
+            Ljets0 = Flatten(name="%s_jets_inp_flt" % self.name)(Ljets0)
+            Ljets = Concatenate(name="%s_jets_out_concat" % self.name)([Ljets,Ljets0])
+            
+            if len(self.fc1_layers)>0:
+                Levj = Concatenate(name="%s_ev_jets_concat" % self.name)([Ljets,Lev])
+                Levj = get_block(Levj,"%s_ev_jets" % self.name,False,
+                                 self.batch_norm,self.noise,self.use_bias,self.dropout,
+                                 self.fc1_layers,self.fc1_activations)
+                
+                L = Multiply(name="%s_mult" % self.name)([Levj,Llinv])
+            else:
+                L = Concatenate(name="%s_concat" % self.name)([Ljets,Lev,Llinv])
+                
+            L = get_block(L,self.name,False,
                          self.batch_norm,self.noise,self.use_bias,self.dropout,
-                          self.layers,self.activations)            
+                         self.fc2_layers,self.fc2_activations)            
+                        
             reshape = False
             out_size = output_shape[0]
             if len(output_shape) > 1:
@@ -180,32 +209,38 @@ class FFWDRegression(BaseEstimator):
         return [csv,checkpoint]
     
     # ----------------------------------------------------------------------------------------------
-    def fit(self,X,y,**kwargs):
+    def fit(self,Xjets,Xev,Xlinv,y,**kwargs):
 
         model = self(True)
         
         has_valid = kwargs.get('validation_data',None) is not None
         if not has_valid and self.valid_frac is not None:
-            last_train = int( X.shape[0] * (1. - self.valid_frac) )
-            X_train = X[:last_train]
-            X_valid = X[last_train:]
+            last_train = int( Xjets.shape[0] * (1. - self.valid_frac) )
+            Xjets_train = Xjets[:last_train]
+            Xjets_valid = Xjets[last_train:]
+            Xev_train = Xev[:last_train]
+            Xev_valid = Xev[last_train:]
+            Xlinv_train = Xlinv[:last_train]
+            Xlinv_valid = Xlinv[last_train:]
             y_train = y[:last_train]
             y_valid = y[last_train:]
-            kwargs['validation_data'] = (X_valid,y_valid)
+            kwargs['validation_data'] = ([Xjets_valid,Xev_valid,Xlinv_valid],y_valid)
             has_valid = True
         else:
-            X_train, y_train = X, y
+            Xjets_train, Xev_valid, Xlinv_valid, y_train = Xjets, Xev, Xlinv, y
+        X_train = [Xjets_train, Xev_valid, Xlinv_valid]
             
         if not 'callbacks' in kwargs:
             save_best_only=kwargs.pop('save_best_only',self.save_best_only)
             kwargs['callbacks'] = self.get_callbacks(has_valid=has_valid,
                                                      save_best_only=save_best_only)
-            
+
+        print(len(X_train))
         return model.fit(X_train,y_train,**kwargs)
     
     # ----------------------------------------------------------------------------------------------
-    def predict(self,X,p0=True,**kwargs):
-        y_pred =  self.model.predict(X,**kwargs)
+    def predict(self,Xjets,Xev,Xlinv,p0=True,**kwargs):
+        y_pred =  self.model.predict([Xjets,Xev,Xlinv],**kwargs)
         if p0:
             return y_pred[:,0]
         else:
